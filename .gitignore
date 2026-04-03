@@ -1,4 +1,4 @@
-# Ignore my private identity key
+# Ignore my private and public identity key
 my_identity_key.pem
 my_identity_public_key.pem
 
