@@ -2,7 +2,7 @@
 my_identity_key.pem
 my_identity_public_key.pem
 
-# Ignore the trusted peers folder but good practice so 
+# Ignore the trusted peers folder
 trusted_peers/
 
 __pycache__/
