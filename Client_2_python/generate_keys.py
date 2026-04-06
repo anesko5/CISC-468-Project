@@ -2,7 +2,6 @@ import os
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
-# Anchor to the directory where this script lives
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def generate_identity():

@@ -1,3 +1,4 @@
+from email.mime import message
 import socket
 import time
 import os
@@ -79,7 +80,7 @@ def load_keys():
     return my_priv_key, trusted_peers
 
 
-def start_raw_server(listen_ip, listen_port, my_priv_key, trusted_peers):
+def start_raw_server(listen_ip, listen_port, my_priv_key, trusted_peers, local_storage_key):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((listen_ip, listen_port))
@@ -89,17 +90,17 @@ def start_raw_server(listen_ip, listen_port, my_priv_key, trusted_peers):
         conn, addr = sock.accept()
         with conn:
             print(f"[+] Connected to {addr}")
-            execute_handshake(conn, my_priv_key, trusted_peers)
+            execute_handshake(conn, my_priv_key, trusted_peers, local_storage_key)
 
-def connect_to_peer_raw(peer_ip, peer_port, my_priv_key, trusted_peers):
+def connect_to_peer_raw(peer_ip, peer_port, my_priv_key, trusted_peers, local_storage_key):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         print(f"[*] Connecting to {peer_ip}:{peer_port}...")
         sock.connect((peer_ip, peer_port))
         print(f"[+] Connected to {peer_ip}")
-        execute_handshake(sock, my_priv_key, trusted_peers)
+        execute_handshake(sock, my_priv_key, trusted_peers, local_storage_key)
 
 
-def execute_handshake(sock, my_identity_private_key, trusted_peers):
+def execute_handshake(sock, my_identity_private_key, trusted_peers, local_storage_key):
     # 1. Prepare keys
     my_id_pub_bytes = my_identity_private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     
@@ -175,24 +176,34 @@ def execute_handshake(sock, my_identity_private_key, trusted_peers):
     pending_downloads = {} # Maps filename -> b64_data payload
     requested_files = [] # Track requested files to correlate responses
 
-    # Start the Receive Thread
+    # Start the Receive Thread    
     threading.Thread(
         target=receive_loop, 
-        args=(sock, session_key, pending_uploads, pending_downloads, requested_files), 
+        args=(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers), # Added trusted_peers
         daemon=True
     ).start()
-    
-    # Run the UI Thread
-    user_interface_loop(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key=get_local_storage_key())
+        
+    user_interface_loop(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key, my_identity_private_key, trusted_peers) # Added both keys
 
+
+def recvall(sock, n):
+    """Helper function to cleanly read exactly n bytes from a TCP socket."""
+    data = bytearray()
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data.extend(packet)
+    return bytes(data)
 
 class PeerListener:
-    def __init__(self, own_name, listen_port, my_priv_key, trusted_peers):
+    def __init__(self, own_name, listen_port, my_priv_key, trusted_peers, local_storage_key):
         self.own_name = own_name
         self.local_ip = get_local_ip()
         self.listen_port = listen_port
         self.my_priv_key = my_priv_key
         self.trusted_peers = trusted_peers
+        self.local_storage_key = local_storage_key 
 
     def remove_service(self, zeroconf, type_, name):
         if name != self.own_name:
@@ -213,11 +224,11 @@ class PeerListener:
             
             if my_address > peer_address:
                 print("[*] I am the Server. Starting listener...")
-                threading.Thread(target=start_raw_server, args=(self.local_ip, self.listen_port, self.my_priv_key, self.trusted_peers)).start()
+                threading.Thread(target=start_raw_server, args=(self.local_ip, self.listen_port, self.my_priv_key, self.trusted_peers, self.local_storage_key)).start()
             else:
                 print("[*] I am the Client. Connecting to peer...")
                 time.sleep(1) 
-                threading.Thread(target=connect_to_peer_raw, args=(peer_ip, peer_port, self.my_priv_key, self.trusted_peers)).start()
+                threading.Thread(target=connect_to_peer_raw, args=(peer_ip, peer_port, self.my_priv_key, self.trusted_peers, self.local_storage_key)).start()
 
                 
 
@@ -238,7 +249,52 @@ def decrypt_message(session_key, encrypted_payload):
     return aesgcm.decrypt(nonce, ciphertext, None)
 
 
-def receive_loop(sock, session_key, pending_uploads, pending_downloads, requested_files):
+def sign_file_data(data, my_priv_key):
+    """Hashes the file, signs it, and appends the fingerprint + signature."""
+    # 1. Hash the original data
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
+    file_hash = digest.finalize()
+    
+    # 2. Sign the hash
+    signature = my_priv_key.sign(file_hash)
+    
+    # 3. Get your 12-byte fingerprint
+    my_pub_bytes = my_priv_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    fingerprint = hashlib.sha256(my_pub_bytes).hexdigest()[:12].encode('utf-8')
+    
+    # Return the bundled package: [Data] + [12-byte Fingerprint] + [64-byte Signature]
+    return data + fingerprint + signature
+
+def verify_and_strip_data(bundle, trusted_peers):
+    """Verifies the attached signature and returns the clean file data."""
+    if len(bundle) < 76:
+        return False, "File is too small to contain a valid signature."
+        
+    original_data = bundle[:-76]
+    fingerprint = bundle[-76:-64].decode('utf-8')
+    signature = bundle[-64:]
+    
+    # 1. Hash the original data exactly as the creator did
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(original_data)
+    file_hash = digest.finalize()
+    
+    # 2. Find the creator's public key in your trusted peers
+    peer_filename = f"peer_{fingerprint}.pem"
+    if peer_filename not in trusted_peers:
+        return False, f"Unknown creator (Fingerprint: {fingerprint}). You do not trust this author."
+        
+    peer_pub_key = trusted_peers[peer_filename]
+    
+    # 3. Verify the signature
+    try:
+        peer_pub_key.verify(signature, file_hash)
+        return True, original_data # Success! Return the clean data.
+    except Exception:
+        return False, "Signature verification failed! File was tampered with."
+
+def receive_loop(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers):
     while True:
         try:
             raw_msglen = recvall(sock, 4)
@@ -254,7 +310,7 @@ def receive_loop(sock, session_key, pending_uploads, pending_downloads, requeste
             plaintext_bytes = decrypt_message(session_key, encrypted_payload)
             message = json.loads(plaintext_bytes.decode('utf-8'))
             
-            handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files)
+            handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers)
             
         except Exception as e:
             print(f"\n[-] Receive loop error: {e}")
@@ -264,17 +320,7 @@ def receive_loop(sock, session_key, pending_uploads, pending_downloads, requeste
     sock.close()
     os._exit(0)
 
-def recvall(sock, n):
-    """Helper function to cleanly read exactly n bytes from a TCP socket."""
-    data = bytearray()
-    while len(data) < n:
-        packet = sock.recv(n - len(data))
-        if not packet:
-            return None
-        data.extend(packet)
-    return bytes(data)
-
-def handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files, local_storage_key=None):
+def handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files, local_storage_key=None, trusted_peers=None):
     action = message.get("action")
     
     if action == "REQ_FILE":
@@ -336,28 +382,56 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
             print(f"\n[PEER ALERT] Peer sent a file: '{filename}'")
             if filename in requested_files:
                 print(f"             This is a response to your request for '{filename}'.")
-                requested_files.remove(filename) # Remove from tracking
-
+                requested_files.remove(filename) 
             else:
                 print(f"             You did not request '{filename}'. It will not be downloaded.")
                 return
-
         else:
             print(f"\n[-] Peer sent empty file data for '{filename}'")
             return
 
         file_bytes = base64.b64decode(b64_data)
+        
+        is_valid, result = verify_and_strip_data(file_bytes, trusted_peers)
+        if not is_valid:
+            print(f"\n[ SECURITY ALERT] {result}")
+            print(f"[-] Dropping tampered file '{filename}'.")
+            print("P2P> ", end="", flush=True)
+            return
+
         safe_filename = f"received_{filename}"
         filepath = os.path.join(BASE_DIR, "available_files", safe_filename)
+        
+        # Encrypt the full signed bundle (file_bytes) so you can forward it to others later
         encrypted_file_bytes = encrypt_message(local_storage_key, file_bytes)
 
-        with open(safe_filename, "wb") as f:
-            f.write(file_bytes)
-        print(f"[*] Saved '{filename}' to disk as '{safe_filename}'.")
+        with open(filepath, "wb") as f:   
+            f.write(encrypted_file_bytes)
+            
+        print(f"[*] Signature verified! Saved '{filename}' to disk as '{safe_filename}'.")
         print("P2P> ", end="", flush=True)
 
-
-
+    elif action == "KEY_MIGRATION":
+        b64_key = message.get("new_key")
+        raw_key = base64.b64decode(b64_key)
+        fingerprint = hashlib.sha256(raw_key).hexdigest()[:12]
+        
+        print("\n\n[KEY MIGRATION] Peer is migrating to a new identity key!")
+        print(f"[*] Automatically accepting new key (Fingerprint: {fingerprint}) over the network...")
+        
+        new_pub = ed25519.Ed25519PublicKey.from_public_bytes(raw_key)
+        filename = f"peer_{fingerprint}.pem"
+        filepath = os.path.join(BASE_DIR, "trusted_peers", filename)
+        
+        with open(filepath, "wb") as f:
+            f.write(new_pub.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo))
+            
+        print(f"[+] New key saved as {filename}.")
+        print("[!] Terminating current session to establish a fresh, secure tunnel with the new key.")
+        print("    Please restart the application.")
+        
+        sock.close()
+        os._exit(0)
         
 
     elif action == "SEND_LIST":
@@ -436,11 +510,51 @@ def send_response_file_to_peer(sock, session_key, filename, local_storage_key):
         print(f"\n[-] Error: '{filename}' does not exist in your available_files directory.")
 
 
-
-def user_interface_loop(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key=None):
-    print("\n[+] Secure Tunnel Ready.")
-    print("Commands: send <file>, request <file>, approve <file>, deny <file>, accept <file>, reject <file>, request_list, exit")
+def perform_key_migration(sock, session_key):
+    print("\n[*] Generating brand new Ed25519 Identity Key...")
     
+    # 1. Generate new keys
+    new_priv_key = ed25519.Ed25519PrivateKey.generate()
+    new_pub_key = new_priv_key.public_key()
+    
+    # 2. Overwrite the old compromised keys on disk
+    priv_path = os.path.join(BASE_DIR, "my_identity_key.pem")
+    with open(priv_path, "wb") as f:
+        f.write(new_priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+        
+    pub_path = os.path.join(BASE_DIR, "my_identity_public_key.pem")
+    with open(pub_path, "wb") as f:
+        f.write(new_pub_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ))
+        
+    # 3. Package and encrypt the new public key for the peer
+    pub_bytes = new_pub_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    b64_pub = base64.b64encode(pub_bytes).decode('utf-8')
+    
+    req_dict = {"action": "KEY_MIGRATION", "new_key": b64_pub}
+    payload = json.dumps(req_dict).encode('utf-8')
+    encrypted_payload = encrypt_message(session_key, payload)
+    
+    # 4. Send the notification
+    sock.sendall(struct.pack('!I', len(encrypted_payload)) + encrypted_payload)
+    
+    print("[+] Key migrated successfully and peer notified.")
+    print("[!] The application will now exit to re-establish secure tunnels. Please restart.")
+    
+    # 5. Kill the compromised tunnel
+    sock.close()
+    os._exit(0)
+
+
+def user_interface_loop(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key=None, my_priv_key=None, trusted_peers=None):
+    print("\n[+] Secure Tunnel Ready.")
+    print("Commands: send <file>, request <file>, approve <file>, deny <file>, accept <file>, reject <file>, request_list, import <file>, export <file>, migrate, exit")    
     while True:
         try:
             command = input("P2P> ").strip()
@@ -477,15 +591,48 @@ def user_interface_loop(sock, session_key, pending_uploads, pending_downloads, r
             elif cmd == "accept" and len(parts) == 2:
                 filename = parts[1]
                 if filename in pending_downloads:
-                    # Retrieve from memory, decode, and save securely
-                    file_bytes = base64.b64decode(pending_downloads[filename])
+                    signed_bytes = base64.b64decode(pending_downloads[filename])
+                    
+                    # --- OFFLINE VERIFICATION ---
+                    is_valid, result = verify_and_strip_data(signed_bytes, trusted_peers)
+                    if not is_valid:
+                        print(f"\n[SECURITY ALERT] {result}")
+                        print(f"[-] Dropping tampered file '{filename}'.")
+                        del pending_downloads[filename]
+                        continue
+                    # ----------------------------
+
+                    # If valid, encrypt the original signed bundle and save it
                     safe_filename = f"received_{filename}"
-                    with open(safe_filename, "wb") as f:
-                        f.write(file_bytes)
+                    filepath = os.path.join(BASE_DIR, "available_files", safe_filename)
+                    encrypted_file_bytes = encrypt_message(local_storage_key, signed_bytes)
+                    
+                    with open(filepath, "wb") as f:
+                        f.write(encrypted_file_bytes)
                     del pending_downloads[filename]
-                    print(f"[*] Saved '{filename}' to disk as '{safe_filename}'.")
-                else:
-                    print(f"[-] No pending download for '{filename}'.")
+                    print(f"[*] Signature verified! Saved as '{safe_filename}'.")   
+
+
+
+            elif cmd == "import" and len(parts) == 2:
+                source_filename = parts[1]
+                source_path = os.path.join(BASE_DIR, source_filename)
+                try:
+                    with open(source_path, "rb") as f:
+                        plaintext_bytes = f.read()
+                        
+                    # 1. Sign the file!
+                    signed_bytes = sign_file_data(plaintext_bytes, my_priv_key)
+                    
+                    # 2. Encrypt the signed bundle for local storage
+                    encrypted_bytes = encrypt_message(local_storage_key, signed_bytes)
+                    
+                    dest_path = os.path.join(BASE_DIR, "available_files", source_filename)
+                    with open(dest_path, "wb") as f:
+                        f.write(encrypted_bytes)
+                    print(f"[*] Successfully signed, encrypted, and imported '{source_filename}'.")
+                except FileNotFoundError:
+                    print(f"[-] Error: Could not find '{source_filename}'.")
 
             elif cmd == "reject" and len(parts) == 2:
                 filename = parts[1]
@@ -511,8 +658,38 @@ def user_interface_loop(sock, session_key, pending_uploads, pending_downloads, r
                 sock.sendall(struct.pack('!I', len(encrypted_payload)) + encrypted_payload)
                 print("[*] Requested file list from peer. Waiting for response...")
                 
+
+            elif cmd == "export" and len(parts) == 2:
+                filename = parts[1]
+                secure_path = os.path.join(BASE_DIR, "available_files", filename)
+                try:
+                    with open(secure_path, "rb") as f:
+                        encrypted_bytes = f.read()
+                    
+                    # 1. Decrypt from local storage
+                    signed_bytes = decrypt_message(local_storage_key, encrypted_bytes)
+                    
+                    # 2. Strip the 76-byte tail so it opens normally
+                    clean_plaintext = signed_bytes[:-76]
+                    
+                    export_path = os.path.join(BASE_DIR, f"decrypted_{filename}")
+                    with open(export_path, "wb") as f:
+                        f.write(clean_plaintext)
+                    print(f"[+] Exported '{filename}' natively as 'decrypted_{filename}'.")
+                except FileNotFoundError:
+                    print(f"[-] Error: '{filename}' not found.")
+
+
+            elif cmd == "migrate":
+                print("\n[!] WARNING: This will overwrite your Identity Key and terminate current sessions.")
+                confirm = input("Are you sure your key is compromised? (y/n): ")
+                if confirm.strip().lower() == 'y':
+                    perform_key_migration(sock, session_key)
+
             else:
                 print("[-] Unknown command or missing filename.")
+
+            
                 
         except Exception as e:
             print(f"[-] Interface error: {e}")
@@ -529,8 +706,7 @@ def main():
 
     local_ip = get_local_ip()
     listen_port = 5000  
-    node_name = f"PythonClient-{local_ip.replace('.', '-')}.{SERVICE_TYPE}"
-
+    node_name = f"PythonClient-{listen_port}-{local_ip.replace('.', '-')}.{SERVICE_TYPE}"
     print(f"Starting P2P Node on {local_ip}:{listen_port}...")
 
     zc = Zeroconf()
@@ -541,13 +717,12 @@ def main():
         addresses=[socket.inet_aton(local_ip)],
         port=listen_port,
         properties={'version': '1.0', 'lang': 'python'},
-        server=f"{local_ip.replace('.', '-')}.local." 
-    )
+        server=f"client-{listen_port}-{local_ip.replace('.', '-')}.local."    )
 
     print(f"Advertising service: {node_name}")
     zc.register_service(info)
 
-    listener = PeerListener(own_name=node_name, listen_port=listen_port, my_priv_key=my_priv_key, trusted_peers=trusted_peers) 
+    listener = PeerListener(own_name=node_name, listen_port=listen_port, my_priv_key=my_priv_key, trusted_peers=trusted_peers, local_storage_key=local_storage_key) 
     browser = ServiceBrowser(zc, SERVICE_TYPE, listener)
 
     try:
