@@ -80,7 +80,7 @@ func main() {
 
 		case "discover":
 
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			defer cancel()
 
 			peerList, err = node.discover(ctx)
@@ -153,6 +153,19 @@ func main() {
 				fmt.Println("-", peer)
 			}
 
+		case "import":
+			fmt.Println("Importing files to secure storage.")
+			importFiles(storageKey)
+
+		case "export":
+			if len(args) < 2 {
+				fmt.Println("Usage: export <filename>")
+			}
+			filename := args[1]
+
+			fmt.Println("Exporting files to secure storage.")
+			exportFile(filename, storageKey)
+
 		case "exit", "quit":
 			fmt.Println("Logging off...")
 			for _, conn := range peerManager.connections {
@@ -161,7 +174,7 @@ func main() {
 			return
 
 		default:
-			fmt.Println("Available commands: 'peers', 'initiate <peerID>', 'discover'")
+			fmt.Println("Available commands: 'peers', 'initiate <peerID>', 'discover', 'import'")
 		}
 	}
 }

@@ -210,10 +210,9 @@ func startDHKE(host *Node, peer *Node, privIdentity ed25519.PrivateKey, pubIdent
 	if ok {
 		fmt.Println("Peer is already a contact! Connecting now...")
 	} else {
-		var answer string
 		fmt.Print("This is a new peer, would you like to Trust on First Use (y/n): ")
-		fmt.Scanln(&answer)
-		if answer != "y" && answer != "Y" {
+
+		if !getConsent() {
 			return nil, nil, "", fmt.Errorf("The peer was not trusted on first use. Aborting...")
 		}
 	}
@@ -294,8 +293,8 @@ func DeriveSessionKey(sharedSecret []byte) ([]byte, error) {
 func saveContact(peerIdentity []byte) (string, error) {
 
 	//Create short hash digest of the peer's public identity
-	fingerprint := peerIdentity[:12]
-	fingerprintHex := hex.EncodeToString(fingerprint)
+	hash := sha256.Sum256(peerIdentity)
+	fingerprintHex := hex.EncodeToString(hash[:])[:12]
 
 	//Create filename using hash digest
 	filename := fmt.Sprintf("peer_%s.pem", fingerprintHex)
@@ -325,8 +324,8 @@ func saveContact(peerIdentity []byte) (string, error) {
 
 func compareHashes(id []byte, contactDir string) bool {
 
-	fingerprint := id[:12]
-	fingerprintHex := hex.EncodeToString(fingerprint)
+	hash := sha256.Sum256(id)
+	fingerprintHex := hex.EncodeToString(hash[:])[:12]
 
 	filename := fmt.Sprintf("peer_%s.pem", fingerprintHex)
 	fullpath := filepath.Join(contactDir, filename)
