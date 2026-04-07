@@ -179,7 +179,7 @@ def execute_handshake(sock, my_identity_private_key, trusted_peers, local_storag
     # Start the Receive Thread    
     threading.Thread(
         target=receive_loop, 
-        args=(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers), # Added trusted_peers
+        args=(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers, authenticated_peer), # Added trusted_peers
         daemon=True
     ).start()
         
@@ -294,7 +294,7 @@ def verify_and_strip_data(bundle, trusted_peers):
     except Exception:
         return False, "Signature verification failed! File was tampered with."
 
-def receive_loop(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers):
+def receive_loop(sock, session_key, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers, current_peer_filename=None):
     while True:
         try:
             raw_msglen = recvall(sock, 4)
@@ -310,7 +310,7 @@ def receive_loop(sock, session_key, pending_uploads, pending_downloads, requeste
             plaintext_bytes = decrypt_message(session_key, encrypted_payload)
             message = json.loads(plaintext_bytes.decode('utf-8'))
             
-            handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers)
+            handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files, local_storage_key, trusted_peers, current_peer_filename)
             
         except Exception as e:
             print(f"\n[-] Receive loop error: {e}")
@@ -320,7 +320,7 @@ def receive_loop(sock, session_key, pending_uploads, pending_downloads, requeste
     sock.close()
     os._exit(0)
 
-def handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files, local_storage_key=None, trusted_peers=None):
+def handle_incoming_message(sock, session_key, message, pending_uploads, pending_downloads, requested_files, local_storage_key=None, trusted_peers=None, current_peer_filename=None):
     action = message.get("action")
     
     if action == "REQ_FILE":
@@ -417,6 +417,15 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
         fingerprint = hashlib.sha256(raw_key).hexdigest()[:12]
         
         print("\n\n[KEY MIGRATION] Peer is migrating to a new identity key!")
+        
+        # --- NEW: Safely delete the currently authenticated peer's old key ---
+        if current_peer_filename:
+            old_filepath = os.path.join(BASE_DIR, "trusted_peers", current_peer_filename)
+            if os.path.exists(old_filepath):
+                os.remove(old_filepath)
+                print(f"[*] Deleted compromised old key: {current_peer_filename}")
+        # ---------------------------------------------------------------------
+        
         print(f"[*] Automatically accepting new key (Fingerprint: {fingerprint}) over the network...")
         
         new_pub = ed25519.Ed25519PublicKey.from_public_bytes(raw_key)
@@ -432,7 +441,6 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
         
         sock.close()
         os._exit(0)
-        
 
     elif action == "SEND_LIST":
         file_list = message.get("data", [])
