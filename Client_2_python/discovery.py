@@ -324,7 +324,7 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
     action = message.get("action")
     
     if action == "REQ_FILE":
-        filename = message.get("filename")
+        filename = message.get("filename")           
         print(f"\n[PEER ALERT] Peer is requesting file: '{filename}'")
         print(f"             Type 'approve {filename}' or 'deny {filename}' to respond.")
         
@@ -377,6 +377,13 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
     elif action == "RES_FILE":
 
         filename = message.get("filename")
+        if message.get("filelist") == ["NOT_FOUND"]:
+            print(f"\n[-] Peer Alert: The requested file '{filename}' was NOT FOUND on their system.")
+            if filename in requested_files:
+                requested_files.remove(filename) # Clean up your tracking list
+            print("P2P> ", end="", flush=True)
+            return
+        
         b64_data = message.get("payload")
         if b64_data:
             print(f"\n[PEER ALERT] Peer sent a file: '{filename}'")
@@ -412,19 +419,17 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
         print("P2P> ", end="", flush=True)
 
     elif action == "KEY_MIGRATION":
-        b64_key = message.get("new_key")
+        b64_key = message.get("payload")
         raw_key = base64.b64decode(b64_key)
         fingerprint = hashlib.sha256(raw_key).hexdigest()[:12]
         
         print("\n\n[KEY MIGRATION] Peer is migrating to a new identity key!")
         
-        # --- NEW: Safely delete the currently authenticated peer's old key ---
         if current_peer_filename:
             old_filepath = os.path.join(BASE_DIR, "trusted_peers", current_peer_filename)
             if os.path.exists(old_filepath):
                 os.remove(old_filepath)
                 print(f"[*] Deleted compromised old key: {current_peer_filename}")
-        # ---------------------------------------------------------------------
         
         print(f"[*] Automatically accepting new key (Fingerprint: {fingerprint}) over the network...")
         
@@ -442,7 +447,7 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
         sock.close()
         os._exit(0)
 
-    elif action == "SEND_LIST":
+    elif action == "RES_LIST":
         file_list = message.get("filelist", [])
         
         print("\n[+] Peer's Available Files:")
@@ -451,7 +456,7 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
         else:
             for f in file_list:
                 print(f"    - {f}")
-                
+        
         print("P2P> ", end="", flush=True)
 
     else:
@@ -491,20 +496,41 @@ def send_file_to_peer(sock, session_key, filename, local_storage_key):
 
 def send_response_file_to_peer(sock, session_key, filename, local_storage_key):
     filepath = os.path.join(BASE_DIR, "available_files", filename)    
+    
+    # 1. Check if the file actually exists on the hard drive
+    if not os.path.exists(filepath):
+        print(f"\n[-] Error: '{filename}' not found. Sending 'NOT_FOUND' response to peer.")
+        
+        response_dict = {
+            "action": "RES_FILE",
+            "filename": filename,
+            "filelist": ["NOT_FOUND"]
+        }
+        
+        payload_bytes = json.dumps(response_dict).encode('utf-8')
+        encrypted_payload = encrypt_message(session_key, payload_bytes)
+        length_prefix = struct.pack('!I', len(encrypted_payload))
+        
+        sock.sendall(length_prefix + encrypted_payload)
+        return 
+
+    # 2. If it does exist, read, decrypt, and send it
     try:
         with open(filepath, "rb") as f:
             encrypted_file_bytes = f.read()
+            
         try:
             file_bytes = decrypt_message(local_storage_key, encrypted_file_bytes)
         except Exception:
             print(f"\n[-] Critical Error: Cannot decrypt '{filename}'. Invalid Master Password?")
             return
+            
         b64_data = base64.b64encode(file_bytes).decode('utf-8')
         
         response_dict = {
             "action": "RES_FILE",
             "filename": filename,
-            "payload": b64_data
+            "payload": b64_data 
         }
         
         payload_bytes = json.dumps(response_dict).encode('utf-8')
@@ -514,8 +540,8 @@ def send_response_file_to_peer(sock, session_key, filename, local_storage_key):
         sock.sendall(length_prefix + encrypted_payload)
         print(f"\n[+] Successfully sent '{filename}' to peer.")
         
-    except FileNotFoundError:
-        print(f"\n[-] Error: '{filename}' does not exist in your available_files directory.")
+    except Exception as e:
+        print(f"\n[-] Unexpected Error while sending file: {e}")
 
 
 def perform_key_migration(sock, session_key):
@@ -545,7 +571,7 @@ def perform_key_migration(sock, session_key):
     pub_bytes = new_pub_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
     b64_pub = base64.b64encode(pub_bytes).decode('utf-8')
     
-    req_dict = {"action": "KEY_MIGRATION", "new_key": b64_pub}
+    req_dict = {"action": "KEY_MIGRATION", "payload": b64_pub}
     payload = json.dumps(req_dict).encode('utf-8')
     encrypted_payload = encrypt_message(session_key, payload)
     
