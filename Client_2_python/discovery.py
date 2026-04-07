@@ -166,7 +166,7 @@ def execute_handshake(sock, my_identity_private_key, trusted_peers, local_storag
     peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_eph_bytes)
     shared_secret = ephemeral_private_key.exchange(peer_public_key)
     
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"cisc468-p2p-file-transfer")
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"P2P File Transfer")
     session_key = hkdf.derive(shared_secret)
     
     print(f"[+] Session Key Established!")
@@ -335,7 +335,7 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
 
     elif action == "SEND_FILE":
         filename = message.get("filename")
-        b64_data = message.get("data")
+        b64_data = message.get("payload")
         
         if b64_data:
             print(f"\n[PEER ALERT] Peer sent a file: '{filename}'")
@@ -360,8 +360,8 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
                 available_files.append(f)
 
         resp_dict = {
-            "action": "SEND_LIST",
-            "data": available_files
+            "action": "RES_LIST",
+            "filelist": available_files
         }
         
         payload_bytes = json.dumps(resp_dict).encode('utf-8')
@@ -377,7 +377,7 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
     elif action == "RES_FILE":
 
         filename = message.get("filename")
-        b64_data = message.get("data")
+        b64_data = message.get("payload")
         if b64_data:
             print(f"\n[PEER ALERT] Peer sent a file: '{filename}'")
             if filename in requested_files:
@@ -443,7 +443,7 @@ def handle_incoming_message(sock, session_key, message, pending_uploads, pending
         os._exit(0)
 
     elif action == "SEND_LIST":
-        file_list = message.get("data", [])
+        file_list = message.get("filelist", [])
         
         print("\n[+] Peer's Available Files:")
         if not file_list:
@@ -475,7 +475,7 @@ def send_file_to_peer(sock, session_key, filename, local_storage_key):
         response_dict = {
             "action": "SEND_FILE",
             "filename": filename,
-            "data": b64_data
+            "payload": b64_data
         }
         
         payload_bytes = json.dumps(response_dict).encode('utf-8')
@@ -504,7 +504,7 @@ def send_response_file_to_peer(sock, session_key, filename, local_storage_key):
         response_dict = {
             "action": "RES_FILE",
             "filename": filename,
-            "data": b64_data
+            "payload": b64_data
         }
         
         payload_bytes = json.dumps(response_dict).encode('utf-8')
