@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -48,7 +49,7 @@ func downloadAndSecure(filename string, plaintext []byte, localStorageKey []byte
 		return fmt.Errorf("Failed to encrypt file for local storage: %v", err)
 	}
 
-	fileDir := "myFiles"
+	fileDir := "FileStorage"
 	os.MkdirAll(fileDir, 0755)
 
 	fullpath := filepath.Join(fileDir, filename)
@@ -62,7 +63,7 @@ func downloadAndSecure(filename string, plaintext []byte, localStorageKey []byte
 
 func loadSecureFile(filename string, localStorageKey []byte) ([]byte, error) {
 
-	fileDir := "myFiles"
+	fileDir := "FileStorage"
 	fullpath := filepath.Join(fileDir, filename)
 
 	ciphertext, err := os.ReadFile(fullpath)
@@ -76,5 +77,51 @@ func loadSecureFile(filename string, localStorageKey []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
+
+}
+
+func importFiles(localStorageKey []byte) {
+
+	files, _ := getFilesList("ImportFiles")
+	if len(files) == 0 {
+		fmt.Println("There are no files in the 'ImportFiles' directory.")
+		return
+	}
+
+	for _, f := range files {
+		safePath := filepath.Clean(f)
+		fullpath := filepath.Join("ImportFiles", safePath)
+
+		plaintext, err := os.ReadFile(fullpath)
+		if err != nil {
+			fmt.Printf("\nFailed to read file from disk: %v\n", err)
+			return
+		}
+		signedData, err := signData(plaintext)
+		err = downloadAndSecure(safePath, signedData, localStorageKey)
+		if err != nil {
+			fmt.Printf("\nFailed to import file '%s' to File Storage\n", safePath)
+			return
+		}
+	}
+}
+
+func exportFile(filename string, localStorageKey []byte) {
+
+	fileBytes, err := loadSecureFile(filename, localStorageKey)
+	if err != nil {
+		fmt.Printf("\n%v", err)
+	}
+
+	cleanData, err := verifyData(fileBytes)
+
+	fullpath := filepath.Join("ImportFiles", filename)
+
+	err = os.WriteFile(fullpath, cleanData, 0644)
+	if err != nil {
+		log.Fatalf("Failed to export file '%s': %v", filename, err)
+	}
+
+	fmt.Printf("\nSuccessfuly decrypted and exported file '%s' to folder 'ImportFiles'\n", filename)
 
 }

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type message struct {
@@ -26,6 +27,10 @@ type message struct {
 	Payload  []byte   `json:"payload"`
 	FileList []string `json:"filelist"`
 }
+
+var pendingDownloads sync.Map
+
+var pendingUploads sync.Map
 
 func getConsent() bool {
 	response := "x"
@@ -92,17 +97,143 @@ func handleOutbound(conn net.Conn, sessionKey []byte, storageKey []byte) {
 				continue
 			}
 
+			signedData, err := signData(fileBytes)
+			if err != nil {
+				fmt.Printf("Error signing file: %v\n", err)
+				continue
+			}
+
 			msg := message{
 				Action:   "SEND_FILE",
 				Filename: safePath,
-				Payload:  fileBytes,
+				Payload:  signedData,
 			}
+
 			err = sendMessage(conn, msg, sessionKey)
 			if err != nil {
 				fmt.Printf("Error sending file '%s': %v\n", msg.Filename, err)
 				continue
 			}
+
 			fmt.Printf("File '%s' has been sent to peer for approval!\n", msg.Filename)
+
+		case "accept":
+			if len(args) < 2 {
+				fmt.Printf("Usage: accept <filename>")
+				continue
+			}
+
+			filename := args[1]
+
+			payloadInterface, exists := pendingDownloads.Load(filename)
+			if !exists {
+				fmt.Printf("No pending download for '%s'.\n", filename)
+			}
+
+			payload := payloadInterface.([]byte)
+			pendingDownloads.Delete(filename)
+
+			_, err := verifyData(payload)
+			if err != nil {
+				fmt.Printf("\n[!] CRITICAL: %v\n", err)
+				fmt.Println("Dropping tampered file.")
+				continue
+			}
+
+			err = downloadAndSecure(filename, payload, storageKey)
+			if err != nil {
+				fmt.Printf("[!] Error downloading file '%s': %v\n", filename, err)
+				continue
+			}
+
+			fmt.Printf("Successfully downloaded '%s' to FileStorage!\n", filename)
+
+		case "reject":
+			if len(args) < 2 {
+				fmt.Println("Usage: reject <filename>")
+				continue
+			}
+
+			filename := args[1]
+
+			pendingDownloads.Delete(filename)
+			fmt.Printf("File %s has been rejected.\n", filename)
+
+		case "approve":
+			if len(args) < 2 {
+				fmt.Println("Usage: approve <filename>")
+				continue
+			}
+			filename := args[1]
+
+			_, exists := pendingUploads.Load(filename)
+			if !exists {
+				fmt.Printf("No pending request for file %s.\n", filename)
+				continue
+			}
+
+			safePath := filepath.Clean(filename)
+			fullpath := filepath.Join("FileStorage", safePath)
+
+			if _, err := os.Stat(fullpath); err != nil {
+				fmt.Printf("File '%s' does not exist. Notifying peer...\n", safePath)
+				denialMsg := message{Action: "RES_FILE", Filename: filename, FileList: []string{"NOT_FOUND"}}
+				sendMessage(conn, denialMsg, sessionKey)
+				pendingUploads.Delete(filename)
+				continue
+			}
+
+			fileBytes, err := loadSecureFile(safePath, storageKey)
+			if err != nil {
+				fmt.Printf("Error loading file '%s' from storage: %v", filename, err)
+				pendingUploads.Delete(filename)
+				continue
+			}
+
+			signedData, err := signData(fileBytes)
+			if err != nil {
+				fmt.Printf("Error signing file: %v\n", err)
+				pendingUploads.Delete(filename)
+				continue
+			}
+
+			responseMsg := message{
+				Action:   "RES_FILE",
+				Filename: filename,
+				Payload:  signedData,
+			}
+
+			err = sendMessage(conn, responseMsg, sessionKey)
+			if err != nil {
+				fmt.Printf("Error sending message: %v", err)
+				continue
+			}
+
+			fmt.Printf("File '%s' has been approved and is being sent to peer\n", filename)
+			pendingUploads.Delete(filename)
+
+		case "deny":
+			if len(args) < 2 {
+				fmt.Println("Usage: deny <filename>")
+				continue
+			}
+			filename := args[1]
+
+			_, exists := pendingUploads.Load(filename)
+			if !exists {
+				fmt.Printf("No pending file request for '%s'\n", filename)
+				continue
+			}
+
+			denialMsg := message{
+				Action:   "RES_FILE",
+				Filename: filename,
+				FileList: []string{"DENIED"},
+			}
+			sendMessage(conn, denialMsg, sessionKey)
+
+			pendingUploads.Delete(filename)
+			fmt.Printf("Rejected request for file '%s'\n", filename)
 
 		case "exit", "quit":
 			fmt.Println("Leaving peer session...")
@@ -135,7 +266,7 @@ func handleInbound(conn net.Conn, sessionKey []byte, storageKey []byte, peerID s
 		case "REQ_LIST":
 
 			//Fetch list of available files
-			files, _ := getFilesList("myFiles")
+			files, _ := getFilesList("FileStorage")
 
 			//Package into a message struct
 			responseMsg := message{
@@ -153,55 +284,17 @@ func handleInbound(conn net.Conn, sessionKey []byte, storageKey []byte, peerID s
 
 			//Prompt the user of success
 			fmt.Println("List of available files has been sent to peer!")
+			fmt.Printf("\t<%s --- cmd> ", peerName)
 
 		//Handle the peer requesting a file
 		case "REQ_FILE":
 
 			//Clean the path; Do this to avoid directory traversal attacks
-			safePath := filepath.Clean(msg.Filename)
-			fullPath := filepath.Join("myFiles", safePath)
+			fmt.Printf("\n\n[ALERT] Peer %s is requesting file '%s'.\n", peerName, msg.Filename)
+			fmt.Printf("\tType 'approve %s' or 'deny %s' to respond.\n", msg.Filename, msg.Filename)
+			fmt.Printf("\t<%s --- cmd> ", peerName)
 
-			//Get consent from the user to send the file
-			fmt.Printf("[CONSENT REQUIRED] Allow peer %s to download file '%s'? (Y/n): ", peerName, msg.Filename)
-			//If the user does not consent, continue to the next read of the tcp tunnel
-			if !getConsent() {
-				fmt.Println("Request denied.")
-				denialMsg := message{Action: "RES_FILE", Filename: msg.Filename, FileList: []string{"DENIED"}}
-				sendMessage(conn, denialMsg, sessionKey)
-				continue
-			}
-
-			if _, err := os.Stat(fullPath); err != nil {
-				fmt.Printf("File '%s' does not exist in your available files. Notifying peer...\n", safePath)
-				denialMsg := message{Action: "RES_FILE", Filename: msg.Filename, FileList: []string{"NOT_FOUND"}}
-				sendMessage(conn, denialMsg, sessionKey)
-			}
-
-			//Read the entire file
-			fileBytes, err := loadSecureFile(safePath, storageKey)
-
-			//If error, continue to the next read of the tcp tunnel
-			if err != nil {
-				fmt.Printf("Error opening file for reading: %v\n", err)
-				continue
-			}
-
-			//Package the file in a message struct
-			responseMsg := message{
-				Action:   "RES_FILE",
-				Filename: msg.Filename,
-				Payload:  fileBytes,
-			}
-
-			//marshal; encrypt; and send encrypted message
-			err = sendMessage(conn, responseMsg, sessionKey)
-			if err != nil {
-				fmt.Printf("Error sending message: %v\n", err)
-				continue
-			}
-
-			//Prompt user of success
-			fmt.Printf("File %s has been sent to peer!\n", msg.Filename)
+			pendingUploads.Store(msg.Filename, true)
 
 		//Handle the peer responding with their file list
 		case "RES_LIST":
@@ -214,14 +307,25 @@ func handleInbound(conn net.Conn, sessionKey []byte, storageKey []byte, peerID s
 				fmt.Println("- (Peer has shared no files or has none)")
 
 			} else {
+				filename := fmt.Sprintf("peer_%s.txt", peerID)
+				fullpath := filepath.Join("peerLists", filename)
 
-				//ADD A OPEN FILE WITH WRITE TO PEER LIST
+				file, err := os.Create(fullpath)
+				if err != nil {
+					fmt.Printf("Error creating peer's file list: %v\n", err)
+				}
 
 				//Iterate through each filename in the list; print to user
 				for _, filename := range msg.FileList {
 					fmt.Println("-" + filename)
-					//WRITE EACH FILENAME TO THE OPEN FILE
+					if file != nil {
+						file.WriteString(filename + "\n")
+					}
 				}
+				if file != nil {
+					fmt.Printf("Peer's file list has been saved to '%s'\n", fullpath)
+				}
+				fmt.Printf("\t<%s --- cmd> ", peerName)
 			}
 
 		//Handle the peer responding with a requested file
@@ -241,28 +345,27 @@ func handleInbound(conn net.Conn, sessionKey []byte, storageKey []byte, peerID s
 					fmt.Printf("\n[!] Peer does not have the file '%s'\n", msg.Filename)
 					continue
 				}
-
-				//Prompt the user the request has been approved
-				fmt.Printf("Request for file '%s' has been approved! Downloading...\n", msg.Filename)
-				//Begin download
-				downloadAndSecure(msg.Filename, msg.Payload, storageKey)
 			}
+
+			_, err := verifyData(msg.Payload)
+			if err != nil {
+				fmt.Printf("[!] CRITICAL: %v\n", err)
+				fmt.Printf("[!] Dropping tampered file '%s'.\n", msg.Filename)
+				continue
+			}
+
+			fmt.Printf("Request for file '%s' approved! Downloading...\n", msg.Filename)
+			downloadAndSecure(msg.Filename, msg.Payload, storageKey)
+			fmt.Printf("\t<%s --- cmd> ", peerName)
 
 		//Handle the peer sending a file without it being requested
 		case "SEND_FILE":
 
-			//Get consent from the user
-			fmt.Printf("[CONSENT REQUIRED] Peer %s has sent you file '%s'. Approve download? (Y/n): ", peerName, msg.Filename)
+			fmt.Printf("\n\n[PEER ALERT] Peer %s has sent you file '%s'.\n", peerName, msg.Filename)
+			fmt.Printf("\tType 'accept %s' or 'reject %s' to respond.\n", msg.Filename, msg.Filename)
+			fmt.Printf("\t<%s --- cmd> ", peerName)
 
-			//If the user denies it, continue to next tcp read
-			if !getConsent() {
-				fmt.Println("Download denied.")
-				continue
-			}
-
-			//Otherwise, download file
-			fmt.Println("Accepting file...")
-			downloadAndSecure(msg.Filename, msg.Payload, storageKey)
+			pendingDownloads.Store(msg.Filename, msg.Payload)
 
 		case "KEY_MIGRATION":
 			fmt.Printf("\n[!] CRITICAL: Peer '%s' has migrated their key. Repairing contact...\n", peerName)
@@ -281,6 +384,7 @@ func handleInbound(conn net.Conn, sessionKey []byte, storageKey []byte, peerID s
 			if err != nil {
 				fmt.Printf("Failed to store new key: %v\n", err)
 			}
+			fmt.Printf("\t<%s --- cmd> ", peerName)
 
 		}
 
@@ -288,25 +392,6 @@ func handleInbound(conn net.Conn, sessionKey []byte, storageKey []byte, peerID s
 }
 
 func encrypt(plaintext []byte, sessionKey []byte, action string) ([]byte, error) {
-
-	if action == "SEND_FILE" || action == "RES_FILE" {
-		privKey, pubKey, err := loadIdentity("identity_priv.pem", "identity_pub.pem")
-		if err != nil {
-			return nil, fmt.Errorf("Critical error loading keys: %v\n", err)
-		}
-
-		//Create a digitial signature for the file
-		hash := sha256.Sum256(plaintext)
-
-		signature := ed25519.Sign(privKey, hash[:])
-
-		fingerprint := pubKey[:12]
-
-		plaintext = append(plaintext, fingerprint...)
-		plaintext = append(plaintext, signature...)
-	}
-
-	//Create ciphertext
 
 	block, err := aes.NewCipher(sessionKey)
 	if err != nil {
@@ -329,9 +414,6 @@ func encrypt(plaintext []byte, sessionKey []byte, action string) ([]byte, error)
 }
 
 func decrypt(ciphertext []byte, sessionKey []byte) ([]byte, error) {
-
-	//fingerprint := peerIdentity[:12]
-	//fingerprintHex := hex.EncodeToString(fingerprint)
 
 	block, err := aes.NewCipher(sessionKey)
 	if err != nil {
@@ -398,7 +480,6 @@ func sendMessage(conn net.Conn, msg message, sessionKey []byte) error {
 func decodeMessage(conn net.Conn, sessionKey []byte) (message, error) {
 
 	var msg message
-	var emptyMsg message
 
 	sizeBuf := make([]byte, 4)
 
@@ -419,16 +500,9 @@ func decodeMessage(conn net.Conn, sessionKey []byte) (message, error) {
 	}
 
 	plaintext = bytes.Trim(plaintext, "\x00")
-
-	if err := json.Unmarshal(plaintext, &msg); err != nil {
+	err = json.Unmarshal(plaintext, &msg)
+	if err != nil {
 		return msg, fmt.Errorf("Failed to encode plaintext to message format: %v", err)
-	}
-
-	if msg.Action == "RES_FILE" || msg.Action == "SEND_FILE" {
-		err = verifyData(ciphertext)
-		if err != nil {
-			return emptyMsg, err
-		}
 	}
 
 	return msg, nil
@@ -456,30 +530,50 @@ func loadPublicKey(fingerprintHex string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(block.Bytes), nil
 }
 
-func verifyData(data []byte) error {
+func signData(data []byte) ([]byte, error) {
+	privKey, pubKey, err := loadIdentity("identity_priv.pem", "identity_pub.pem")
+	if err != nil {
+		return nil, fmt.Errorf("Critical error loading keys: %v", err)
+	}
+
+	hash := sha256.Sum256(data)
+	signature := ed25519.Sign(privKey, hash[:])
+
+	pubHash := sha256.Sum256(pubKey)
+	fingerprintHex := hex.EncodeToString(pubHash[:])[:12]
+
+	bundle := make([]byte, 0, len(data)+76)
+	bundle = append(bundle, data...)
+	bundle = append(bundle, []byte(fingerprintHex)...)
+	bundle = append(bundle, signature...)
+
+	return bundle, nil
+}
+
+func verifyData(data []byte) ([]byte, error) {
 	if len(data) < 76 {
-		return fmt.Errorf("File is too small to contain a signature")
+		return nil, fmt.Errorf("File is too small to contain a signature")
 	}
 
 	splitIdx := len(data) - 76
-	ciphertext := data[:splitIdx]
+	plaintext := data[:splitIdx]
 	tail := data[splitIdx:]
 
-	fingerprint := tail[:12]
+	fingerprintBytes := tail[:12]
 	signature := tail[12:]
 
-	hash := sha256.Sum256(ciphertext)
+	fingerprintHex := string(fingerprintBytes)
+	hash := sha256.Sum256(plaintext)
 
-	fingerprintHex := hex.EncodeToString(fingerprint)
 	pubKey, err := loadPublicKey(fingerprintHex)
 	if err != nil {
-		return fmt.Errorf("Unknown creator fingerprint: %s\n", fingerprintHex)
+		return nil, fmt.Errorf("Unknown signature '%s': %v", fingerprintHex, err)
 	}
 
 	isValid := ed25519.Verify(pubKey, hash[:], signature)
 	if !isValid {
-		return fmt.Errorf("FILE VERIFICATION FAILED: File has been tampered with.")
+		return nil, fmt.Errorf("FILE VERIFICATION FAILED: File has been tampered with")
 	}
 
-	return nil
+	return plaintext, nil
 }

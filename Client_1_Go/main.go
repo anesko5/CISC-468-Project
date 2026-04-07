@@ -80,32 +80,16 @@ func main() {
 
 		case "discover":
 
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
 
-			done := make(chan []Node)
-
-			go func() {
-				peers, _ := node.discover(ctx)
-				done <- peers
-			}()
-
-			fmt.Println("Searching for peers for 15s... Press [ENTER] to stop search.")
-			userAbort := make(chan string)
-			go func() {
-				scanner.Scan()
-				userAbort <- scanner.Text()
-			}()
-
-			select {
-			case peerList = <-done:
-				fmt.Println("Timeout reached.")
-			case <-userAbort:
-				fmt.Println("Exiting early...")
-				cancel()
-				peerList = <-done
+			peerList, err = node.discover(ctx)
+			if err != nil {
+				fmt.Printf("Discovery Error: %v", err)
+				continue
 			}
 
-			fmt.Println("Here2")
+			fmt.Printf("Search complete! Found %d peers.\n", len(peerList))
 
 			for _, peer := range peerList {
 				conn, sessionKey, fingerprint, err := startDHKE(&node, &peer, privKey, pubKey)
@@ -169,6 +153,19 @@ func main() {
 				fmt.Println("-", peer)
 			}
 
+		case "import":
+			fmt.Println("Importing files to secure storage.")
+			importFiles(storageKey)
+
+		case "export":
+			if len(args) < 2 {
+				fmt.Println("Usage: export <filename>")
+			}
+			filename := args[1]
+
+			fmt.Println("Exporting files to secure storage.")
+			exportFile(filename, storageKey)
+
 		case "exit", "quit":
 			fmt.Println("Logging off...")
 			for _, conn := range peerManager.connections {
@@ -177,7 +174,7 @@ func main() {
 			return
 
 		default:
-			fmt.Println("Available commands: 'peers', 'initiate <peerID>', 'discover'")
+			fmt.Println("Available commands: 'peers', 'initiate <peerID>', 'discover', 'import'")
 		}
 	}
 }
