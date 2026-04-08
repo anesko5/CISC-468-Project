@@ -53,19 +53,23 @@ func (n *Node) discover(ctx context.Context) ([]Node, error) {
 	//Create the return list of peers found
 	peerList := make([]Node, 0, 10)
 
+	//Search for peers on the same service and domain
 	err = resolver.Browse(ctx, n.serviceType, n.domain, entries)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to browse: %v", err)
 	}
 
+	//Iterate through each peer found and append them to the return list
 	for peer := range entries {
 		if peer.Instance != n.nodeID {
 			fmt.Printf("Peer found! Name: %s, IP: %v, Port: %d\n", peer.Instance, peer.AddrIPv4, peer.Port)
+			//Create a node for the current peer
 			tempNode := Node{peer.Instance, n.serviceType, n.domain, peer.AddrIPv4, peer.Port}
+			//Add peer's node to our return list
 			peerList = append(peerList, tempNode)
 		}
 	}
 
+	//Return list of found peers
 	return peerList, nil
-
 }
